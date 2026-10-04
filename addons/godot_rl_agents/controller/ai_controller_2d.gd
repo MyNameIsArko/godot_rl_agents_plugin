@@ -9,6 +9,7 @@ enum ControlModes {
 	RECORD_EXPERT_DEMOS ## Record observations and actions for expert demonstrations
 }
 @export var control_mode: ControlModes = ControlModes.INHERIT_FROM_SYNC
+@export var agent_id := ""
 ## The path to a trained .onnx model file to use for inference (overrides the path set in sync node).
 @export var onnx_model_path := ""
 ## Once the number of steps has passed, the flag 'needs_reset' will be set to 'true' for this instance.
@@ -33,10 +34,36 @@ enum ControlModes {
 var onnx_model: ONNXModel
 
 var heuristic := "human"
-var done := false
+## Store the observation that caused the episode to end.
+var store_obs_done := true
+var obs_done: Dictionary
+var _terminated := false
+var terminated: bool:
+	get:
+		return _terminated
+	set(value):
+		_terminated = value
+		if value and store_obs_done:
+			obs_done = get_obs()
 var reward := 0.0
 var n_steps := 0
 var needs_reset := false
+var truncated := false:
+	get:
+		return _truncated
+	set(value):
+		_truncated = value
+		if value and store_obs_done:
+			obs_done = get_obs()
+var _truncated := false
+
+var done: bool:
+	get:
+		return terminated or truncated
+	set(value):
+		terminated = value
+		if not value:
+			truncated = false
 
 var _player: Node2D
 
@@ -99,6 +126,7 @@ func _physics_process(delta):
 	n_steps += 1
 	if n_steps > reset_after:
 		needs_reset = true
+		truncated = true
 
 
 func get_obs_space():
@@ -112,6 +140,9 @@ func get_obs_space():
 func reset():
 	n_steps = 0
 	needs_reset = false
+	terminated = false
+	truncated = false
+	obs_done = {}
 
 
 func reset_if_done():
@@ -130,6 +161,23 @@ func get_done():
 
 func set_done_false():
 	done = false
+
+
+func get_terminated():
+	return terminated
+
+
+func get_truncated():
+	return truncated
+
+
+func set_truncated_false():
+	truncated = false
+
+
+func get_obs_done() -> Dictionary:
+	var terminal_observation := obs_done
+	return terminal_observation
 
 
 func zero_reward():

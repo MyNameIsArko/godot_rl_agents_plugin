@@ -25,8 +25,15 @@ var onnx_models: Dictionary
 
 const MAJOR_VERSION := "0"
 const MINOR_VERSION := "7"
+const PROTOCOL_TWO_MAJOR := 2
+var protocol_major := 0
+const PROJECT_PROTOCOL_MAJOR := 1
+const PROJECT_PROTOCOL_MINOR := 0
 const DEFAULT_PORT := "11008"
 const DEFAULT_SEED := "1"
+var receive_buffer := PackedByteArray()
+const MAX_FRAME_SIZE := 16 * 1024 * 1024
+const READ_TIMEOUT_MS := 60000
 var stream: StreamPeerTCP = null
 var connected = false
 var message_center
@@ -104,6 +111,11 @@ func _initialize_training_agents():
 		if connected:
 			_set_heuristic("model", agents_training)
 			_handshake()
+			if not connected:
+				return
+			if protocol_major == PROTOCOL_TWO_MAJOR:
+				if not _prepare_protocol_two_agents():
+					return
 			_send_env_info()
 		else:
 			push_warning(
@@ -198,6 +210,13 @@ func _physics_process(_delta):
 
 
 func _training_process():
+	if protocol_major == PROTOCOL_TWO_MAJOR:
+		_training_process_protocol_two()
+		return
+	if protocol_major == PROJECT_PROTOCOL_MAJOR:
+		_training_process_project()
+		return
+
 	if connected:
 		get_tree().set_pause(true)
 
@@ -216,13 +235,168 @@ func _training_process():
 		if need_to_send_obs:
 			need_to_send_obs = false
 			var reward = _get_reward_from_agents()
+			var terminated = _get_terminated_from_agents()
+			var truncated = _get_truncated_from_agents()
 			var done = _get_done_from_agents()
 			#_reset_agents_if_done() # this ensures the new observation is from the next env instance : NEEDS REFACTOR
 
-			var reply = {"type": "step", "obs": obs, "reward": reward, "done": done, "info": info}
+			var reply = {"type": "step", "obs": obs, "reward": reward, "done": done, "terminated": terminated, "truncated": truncated, "info": info}
 			_send_dict_as_json_message(reply)
 
 		var handled = handle_message()
+
+
+func _training_process_project():
+	if connected:
+		get_tree().set_pause(true)
+
+		var obs = _get_obs_from_agents(agents_training)
+		var info = _get_info_from_agents(agents_training)
+
+		if just_reset:
+			just_reset = false
+
+			var reply = {"type": "reset", "observation": obs[0], "info": info[0]}
+			_send_dict_as_json_message(reply)
+			# this should go straight to getting the action and setting it checked the agent, no need to perform one phyics tick
+			get_tree().set_pause(false)
+			return
+
+		if need_to_send_obs:
+			need_to_send_obs = false
+			var reward = _get_reward_from_agents()
+			var terminated = _get_terminated_from_agents()
+			var truncated = _get_truncated_from_agents()
+
+			var reply = {
+				"type": "step",
+				"observation": obs[0],
+				"reward": reward[0],
+				"terminated": terminated[0],
+				"truncated": truncated[0],
+				"info": info[0]
+			}
+			_send_dict_as_json_message(reply)
+
+		var handled = handle_message()
+
+
+func _prepare_protocol_two_agents() -> bool:
+	if agents_training.size() != 2:
+		_protocol_error("Protocol 2 requires exactly two training agents")
+		return false
+	var identifiers: Array[String] = []
+	for agent in agents_training:
+		var identifier = agent.get("agent_id")
+		if not identifier is String or not identifier in ["player_0", "player_1"] or identifiers.has(identifier):
+			_protocol_error("Protocol 2 needs unique player_0 and player_1 identifiers")
+			return false
+		identifiers.append(identifier)
+	agents_training.sort_custom(func(left, right): return left.agent_id < right.agent_id)
+	_obs_space_training.clear()
+	_action_space_training.clear()
+	for agent in agents_training:
+		_obs_space_training.append(agent.get_obs_space())
+		_action_space_training.append(agent.get_action_space())
+	if _obs_space_training[0] != _obs_space_training[1] or _action_space_training[0] != _action_space_training[1]:
+		_protocol_error("Protocol 2 observation and action spaces must match")
+		return false
+	return true
+
+
+func _training_process_protocol_two():
+	if not connected:
+		return
+
+	get_tree().set_pause(true)
+	var obs = _get_obs_from_agents(agents_training)
+	var info = _get_info_from_agents(agents_training)
+
+	if just_reset:
+		just_reset = false
+		var reset_agents := {}
+		for agent_idx in agents_training.size():
+			var agent = agents_training[agent_idx]
+			reset_agents[agent.agent_id] = {"observation": obs[agent_idx], "info": info[agent_idx]}
+		_send_dict_as_json_message({"type": "reset", "agents": reset_agents})
+		get_tree().set_pause(false)
+		return
+
+	if need_to_send_obs:
+		need_to_send_obs = false
+		var reward = []
+		for agent in agents_training:
+			reward.append(agent.get_reward())
+		var terminated = _get_terminated_from_agents()
+		var truncated = _get_truncated_from_agents()
+		var step_agents := {}
+		for agent_idx in agents_training.size():
+			var agent = agents_training[agent_idx]
+			step_agents[agent.agent_id] = {
+				"observation": obs[agent_idx],
+				"reward": reward[agent_idx],
+				"terminated": terminated[agent_idx],
+				"truncated": truncated[agent_idx],
+				"info": info[agent_idx]
+			}
+			agent.zero_reward()
+		if not _validate_protocol_two_step(step_agents):
+			return
+		_send_dict_as_json_message({"type": "step", "agents": step_agents})
+
+	_handle_message_protocol_two()
+
+
+func _handle_message_protocol_two() -> bool:
+	var message = _get_dict_json_message()
+	if message.is_empty():
+		return false
+	if message["type"] == "close":
+		print("received close message, closing game")
+		get_tree().quit()
+		get_tree().set_pause(false)
+		return true
+
+	if message["type"] == "reset":
+		print("resetting all agents")
+		if message.has("seed"):
+			seed(int(message["seed"]))
+		_reset_agents()
+		just_reset = true
+		get_tree().set_pause(false)
+		return true
+
+	if message["type"] == "step":
+		var actions = message.get("actions")
+		if not actions is Dictionary or actions.size() != 2 or not actions.has("player_0") or not actions.has("player_1"):
+			_protocol_error("Protocol 2 step requires actions for player_0 and player_1")
+			return false
+		for agent in agents_training:
+			agent.set_action(actions[agent.agent_id])
+		need_to_send_obs = true
+		get_tree().set_pause(false)
+		return true
+
+	_protocol_error("Protocol 2 message was not handled")
+	return false
+
+
+func _validate_protocol_two_step(step_agents: Dictionary) -> bool:
+	var first: Dictionary = step_agents["player_0"]
+	var second: Dictionary = step_agents["player_1"]
+	if first.terminated != second.terminated or first.truncated != second.truncated or (first.terminated and first.truncated):
+		_protocol_error("Protocol 2 requires matching episode flags without overlap")
+		return false
+	if first.terminated or first.truncated:
+		if not first.info.has("terminal_observation") or not second.info.has("terminal_observation"):
+			_protocol_error("Protocol 2 requires both terminal observations")
+			return false
+		var outcomes = [first.info.get("outcome"), second.info.get("outcome")]
+		outcomes.sort()
+		if outcomes != ["draw", "draw"] and outcomes != ["loss", "win"]:
+			_protocol_error("Protocol 2 requires complementary outcomes")
+			return false
+	return true
 
 
 func _inference_process():
@@ -389,43 +563,125 @@ func _set_heuristic(heuristic, agents: Array):
 
 
 func _handshake():
-	print("performing handshake")
+	var message = _get_dict_json_message()
+	if message.get("type") != "handshake":
+		_protocol_error("Expected a handshake message")
+		return
+	if not message.has("protocol"):
+		if message.get("major_version") != MAJOR_VERSION:
+			_protocol_error("Legacy protocol major mismatch")
+		return
+	var version = message["protocol"]
+	if not version is Dictionary or not (version.get("major") == PROJECT_PROTOCOL_MAJOR or version.get("major") == PROTOCOL_TWO_MAJOR) or version.get("minor") != PROJECT_PROTOCOL_MINOR:
+		_protocol_error("Project protocol version mismatch")
+		return
+	protocol_major = int(version["major"])
+	_send_dict_as_json_message({"type": "handshake", "protocol": {"major": protocol_major, "minor": PROJECT_PROTOCOL_MINOR}})
 
-	var json_dict = _get_dict_json_message()
-	assert(json_dict["type"] == "handshake")
-	var major_version = json_dict["major_version"]
-	var minor_version = json_dict["minor_version"]
-	if major_version != MAJOR_VERSION:
-		print("WARNING: major verison mismatch ", major_version, " ", MAJOR_VERSION)
-	if minor_version != MINOR_VERSION:
-		print("WARNING: minor verison mismatch ", minor_version, " ", MINOR_VERSION)
 
-	print("handshake complete")
-
-
-func _get_dict_json_message():
-	# returns a dictionary from of the most recent message
-	# this is not waiting
-	while stream.get_available_bytes() == 0:
+func _get_dict_json_message() -> Dictionary:
+	# Returns one length-prefixed JSON object from the stream.
+	var deadline := Time.get_ticks_msec() + READ_TIMEOUT_MS
+	while true:
+		if Time.get_ticks_msec() > deadline:
+			return _protocol_error("Timed out while reading a protocol frame")
 		stream.poll()
+		var available := stream.get_available_bytes()
+		if available > 0:
+			var data := stream.get_data(available)
+			if data[0] != OK:
+				return _protocol_error("Failed to read a protocol frame")
+			receive_buffer.append_array(data[1])
+
+		if receive_buffer.size() >= 4:
+			var size := receive_buffer[0] | (receive_buffer[1] << 8) | (receive_buffer[2] << 16) | (receive_buffer[3] << 24)
+			if size > MAX_FRAME_SIZE:
+				return _protocol_error("Protocol frame exceeds 16 MiB")
+			if receive_buffer.size() >= size + 4:
+				var body := receive_buffer.slice(4, size + 4)
+				receive_buffer = receive_buffer.slice(size + 4)
+				var json_data = JSON.parse_string(body.get_string_from_utf8())
+				if not json_data is Dictionary or not _is_finite_value(json_data):
+					return _protocol_error("Protocol frame must contain a finite JSON object")
+				return json_data
+
 		if stream.get_status() != 2:
 			print("server disconnected status, closing")
 			get_tree().quit()
-			return null
+			return {}
 
 		OS.delay_usec(10)
-
-	var message = stream.get_string()
-	var json_data = JSON.parse_string(message)
-
-	return json_data
+	return {}
 
 
 func _send_dict_as_json_message(dict):
-	stream.put_string(JSON.stringify(dict, "", false))
+	if not _is_finite_value(dict):
+		_protocol_error("Protocol message contains NaN or infinity")
+		return
+	var json_bytes: PackedByteArray = JSON.stringify(dict, "", false).to_utf8_buffer()
+	if json_bytes.size() > MAX_FRAME_SIZE:
+		_protocol_error("Protocol frame exceeds 16 MiB")
+		return
+	var size := json_bytes.size()
+	var prefix := PackedByteArray([
+		size & 255,
+		(size >> 8) & 255,
+		(size >> 16) & 255,
+		(size >> 24) & 255
+	])
+	if stream.put_data(prefix) != OK or stream.put_data(json_bytes) != OK:
+		_protocol_error("Failed to send a protocol frame")
+
+
+func _protocol_error(message: String) -> Dictionary:
+	push_error(message)
+	connected = false
+	stream.disconnect_from_host()
+	get_tree().set_pause(false)
+	get_tree().quit(1)
+	return {}
+
+
+func _is_finite_value(value) -> bool:
+	match typeof(value):
+		TYPE_FLOAT:
+			return is_finite(value)
+		TYPE_DICTIONARY:
+			for item in value.values():
+				if not _is_finite_value(item):
+					return false
+		TYPE_ARRAY:
+			for item in value:
+				if not _is_finite_value(item):
+					return false
+	return true
 
 
 func _send_env_info():
+	if protocol_major == PROTOCOL_TWO_MAJOR:
+		var message = _get_dict_json_message()
+		if message.get("type") != "env_info":
+			_protocol_error("Expected env_info")
+			return
+		var agents := []
+		for agent_idx in agents_training.size():
+			var agent = agents_training[agent_idx]
+			agents.append({
+				"id": agent.agent_id,
+				"observation_space": _obs_space_training[agent_idx],
+				"action_space": _action_space_training[agent_idx]
+			})
+		_send_dict_as_json_message({
+			"type": "env_info",
+			"protocol": {"major": PROTOCOL_TWO_MAJOR, "minor": PROJECT_PROTOCOL_MINOR},
+			"agent_count": agents_training.size(),
+			"agents": agents
+		})
+		return
+
+	if protocol_major == PROJECT_PROTOCOL_MAJOR:
+		_send_project_env_info()
+		return
 	var json_dict = _get_dict_json_message()
 	assert(json_dict["type"] == "env_info")
 
@@ -435,6 +691,22 @@ func _send_env_info():
 		"action_space": _action_space_training,
 		"n_agents": len(agents_training),
 		"agent_policy_names": agents_training_policy_names
+	}
+	_send_dict_as_json_message(message)
+
+
+func _send_project_env_info():
+	var json_dict = _get_dict_json_message()
+	assert(json_dict["type"] == "env_info")
+	if agents_training.size() != 1:
+		_protocol_error("Project protocol 1 requires exactly one training agent")
+		return
+	var message = {
+		"type": "env_info",
+		"protocol": {"major": PROJECT_PROTOCOL_MAJOR, "minor": PROJECT_PROTOCOL_MINOR},
+		"observation_space": _obs_space_training[0],
+		"action_space": _action_space_training[0],
+		"agent_count": agents_training.size()
 	}
 	_send_dict_as_json_message(message)
 
@@ -498,7 +770,9 @@ func disconnect_from_server():
 func handle_message() -> bool:
 	# get json message: reset, step, close
 	var message = _get_dict_json_message()
-	if message["type"] == "close":
+	if message.is_empty():
+		return false
+	if message.get("type", "") == "close":
 		print("received close message, closing game")
 		get_tree().quit()
 		get_tree().set_pause(false)
@@ -506,6 +780,8 @@ func handle_message() -> bool:
 
 	if message["type"] == "reset":
 		print("resetting all agents")
+		if message.has("seed"):
+			seed(int(message["seed"]))
 		_reset_agents()
 		just_reset = true
 		get_tree().set_pause(false)
@@ -527,6 +803,12 @@ func handle_message() -> bool:
 		print("calling method from Python")
 		_send_dict_as_json_message(reply)
 		return handle_message()
+
+	if protocol_major == PROJECT_PROTOCOL_MAJOR and message.get("type") == "step":
+		agents_training[0].set_action(message["action"])
+		need_to_send_obs = true
+		get_tree().set_pause(false)
+		return true
 
 	if message["type"] == "action":
 		var action = message["action"]
@@ -556,7 +838,8 @@ func _reset_agents_if_done(agents = all_agents):
 func _reset_agents(agents = all_agents):
 	for agent in agents:
 		agent.needs_reset = true
-		#agent.reset()
+		if protocol_major != 0:
+			agent.reset()
 
 
 func _get_obs_from_agents(agents: Array = all_agents):
@@ -577,8 +860,25 @@ func _get_reward_from_agents(agents: Array = agents_training):
 func _get_info_from_agents(agents: Array = all_agents):
 	var info = []
 	for agent in agents:
-		info.append(agent.get_info())
+		var agent_info: Dictionary = agent.get_info().duplicate()
+		if agent.get_terminated() or agent.get_truncated():
+			agent_info["terminal_observation"] = agent.get_obs_done()
+		info.append(agent_info)
 	return info
+
+
+func _get_terminated_from_agents(agents: Array = agents_training):
+	var terminated = []
+	for agent in agents:
+		terminated.append(agent.get_terminated())
+	return terminated
+
+
+func _get_truncated_from_agents(agents: Array = agents_training):
+	var truncated = []
+	for agent in agents:
+		truncated.append(agent.get_truncated())
+	return truncated
 
 
 func _get_done_from_agents(agents: Array = agents_training):

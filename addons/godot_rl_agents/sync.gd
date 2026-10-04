@@ -27,6 +27,9 @@ const MAJOR_VERSION := "0"
 const MINOR_VERSION := "7"
 const DEFAULT_PORT := "11008"
 const DEFAULT_SEED := "1"
+var receive_buffer := PackedByteArray()
+const MAX_FRAME_SIZE := 16 * 1024 * 1024
+const READ_TIMEOUT_MS := 60000
 var stream: StreamPeerTCP = null
 var connected = false
 var message_center
@@ -394,7 +397,7 @@ func _handshake():
 	print("performing handshake")
 
 	var json_dict = _get_dict_json_message()
-	assert(json_dict["type"] == "handshake")
+	assert(json_dict.get("type", "") == "handshake")
 	var major_version = json_dict["major_version"]
 	var minor_version = json_dict["minor_version"]
 	if major_version != MAJOR_VERSION:
@@ -405,26 +408,82 @@ func _handshake():
 	print("handshake complete")
 
 
-func _get_dict_json_message():
-	# returns a dictionary from of the most recent message
-	# this is not waiting
-	while stream.get_available_bytes() == 0:
+func _get_dict_json_message() -> Dictionary:
+	# Returns one length-prefixed JSON object from the stream.
+	var deadline := Time.get_ticks_msec() + READ_TIMEOUT_MS
+	while true:
+		if Time.get_ticks_msec() > deadline:
+			return _protocol_error("Timed out while reading a protocol frame")
 		stream.poll()
+		var available := stream.get_available_bytes()
+		if available > 0:
+			var data := stream.get_data(available)
+			if data[0] != OK:
+				return _protocol_error("Failed to read a protocol frame")
+			receive_buffer.append_array(data[1])
+
+		if receive_buffer.size() >= 4:
+			var size := receive_buffer[0] | (receive_buffer[1] << 8) | (receive_buffer[2] << 16) | (receive_buffer[3] << 24)
+			if size > MAX_FRAME_SIZE:
+				return _protocol_error("Protocol frame exceeds 16 MiB")
+			if receive_buffer.size() >= size + 4:
+				var body := receive_buffer.slice(4, size + 4)
+				receive_buffer = receive_buffer.slice(size + 4)
+				var json_data = JSON.parse_string(body.get_string_from_utf8())
+				if not json_data is Dictionary or not _is_finite_value(json_data):
+					return _protocol_error("Protocol frame must contain a finite JSON object")
+				return json_data
+
 		if stream.get_status() != 2:
 			print("server disconnected status, closing")
 			get_tree().quit()
-			return null
+			return {}
 
 		OS.delay_usec(10)
-
-	var message = stream.get_string()
-	var json_data = JSON.parse_string(message)
-
-	return json_data
+	return {}
 
 
 func _send_dict_as_json_message(dict):
-	stream.put_string(JSON.stringify(dict, "", false))
+	if not _is_finite_value(dict):
+		_protocol_error("Protocol message contains NaN or infinity")
+		return
+	var json_bytes: PackedByteArray = JSON.stringify(dict, "", false).to_utf8_buffer()
+	if json_bytes.size() > MAX_FRAME_SIZE:
+		_protocol_error("Protocol frame exceeds 16 MiB")
+		return
+	var size := json_bytes.size()
+	var prefix := PackedByteArray([
+		size & 255,
+		(size >> 8) & 255,
+		(size >> 16) & 255,
+		(size >> 24) & 255
+	])
+	if stream.put_data(prefix) != OK or stream.put_data(json_bytes) != OK:
+		_protocol_error("Failed to send a protocol frame")
+
+
+func _protocol_error(message: String) -> Dictionary:
+	push_error(message)
+	connected = false
+	stream.disconnect_from_host()
+	get_tree().set_pause(false)
+	get_tree().quit(1)
+	return {}
+
+
+func _is_finite_value(value) -> bool:
+	match typeof(value):
+		TYPE_FLOAT:
+			return is_finite(value)
+		TYPE_DICTIONARY:
+			for item in value.values():
+				if not _is_finite_value(item):
+					return false
+		TYPE_ARRAY:
+			for item in value:
+				if not _is_finite_value(item):
+					return false
+	return true
 
 
 func _send_env_info():
@@ -500,7 +559,7 @@ func disconnect_from_server():
 func handle_message() -> bool:
 	# get json message: reset, step, close
 	var message = _get_dict_json_message()
-	if message["type"] == "close":
+	if message.get("type", "") == "close":
 		print("received close message, closing game")
 		get_tree().quit()
 		get_tree().set_pause(false)

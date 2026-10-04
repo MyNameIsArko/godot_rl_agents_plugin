@@ -25,6 +25,7 @@ var onnx_models: Dictionary
 
 const MAJOR_VERSION := "0"
 const MINOR_VERSION := "7"
+const PROTOCOL_TWO_MAJOR := 2
 var protocol_major := 0
 const PROJECT_PROTOCOL_MAJOR := 1
 const PROJECT_PROTOCOL_MINOR := 0
@@ -112,6 +113,9 @@ func _initialize_training_agents():
 			_handshake()
 			if not connected:
 				return
+			if protocol_major == PROTOCOL_TWO_MAJOR:
+				if not _prepare_protocol_two_agents():
+					return
 			_send_env_info()
 		else:
 			push_warning(
@@ -206,6 +210,9 @@ func _physics_process(_delta):
 
 
 func _training_process():
+	if protocol_major == PROTOCOL_TWO_MAJOR:
+		_training_process_protocol_two()
+		return
 	if protocol_major == PROJECT_PROTOCOL_MAJOR:
 		_training_process_project()
 		return
@@ -272,6 +279,124 @@ func _training_process_project():
 			_send_dict_as_json_message(reply)
 
 		var handled = handle_message()
+
+
+func _prepare_protocol_two_agents() -> bool:
+	if agents_training.size() != 2:
+		_protocol_error("Protocol 2 requires exactly two training agents")
+		return false
+	var identifiers: Array[String] = []
+	for agent in agents_training:
+		var identifier = agent.get("agent_id")
+		if not identifier is String or not identifier in ["player_0", "player_1"] or identifiers.has(identifier):
+			_protocol_error("Protocol 2 needs unique player_0 and player_1 identifiers")
+			return false
+		identifiers.append(identifier)
+	agents_training.sort_custom(func(left, right): return left.agent_id < right.agent_id)
+	_obs_space_training.clear()
+	_action_space_training.clear()
+	for agent in agents_training:
+		_obs_space_training.append(agent.get_obs_space())
+		_action_space_training.append(agent.get_action_space())
+	if _obs_space_training[0] != _obs_space_training[1] or _action_space_training[0] != _action_space_training[1]:
+		_protocol_error("Protocol 2 observation and action spaces must match")
+		return false
+	return true
+
+
+func _training_process_protocol_two():
+	if not connected:
+		return
+
+	get_tree().set_pause(true)
+	var obs = _get_obs_from_agents(agents_training)
+	var info = _get_info_from_agents(agents_training)
+
+	if just_reset:
+		just_reset = false
+		var reset_agents := {}
+		for agent_idx in agents_training.size():
+			var agent = agents_training[agent_idx]
+			reset_agents[agent.agent_id] = {"observation": obs[agent_idx], "info": info[agent_idx]}
+		_send_dict_as_json_message({"type": "reset", "agents": reset_agents})
+		get_tree().set_pause(false)
+		return
+
+	if need_to_send_obs:
+		need_to_send_obs = false
+		var reward = []
+		for agent in agents_training:
+			reward.append(agent.get_reward())
+		var terminated = _get_terminated_from_agents()
+		var truncated = _get_truncated_from_agents()
+		var step_agents := {}
+		for agent_idx in agents_training.size():
+			var agent = agents_training[agent_idx]
+			step_agents[agent.agent_id] = {
+				"observation": obs[agent_idx],
+				"reward": reward[agent_idx],
+				"terminated": terminated[agent_idx],
+				"truncated": truncated[agent_idx],
+				"info": info[agent_idx]
+			}
+			agent.zero_reward()
+		if not _validate_protocol_two_step(step_agents):
+			return
+		_send_dict_as_json_message({"type": "step", "agents": step_agents})
+
+	_handle_message_protocol_two()
+
+
+func _handle_message_protocol_two() -> bool:
+	var message = _get_dict_json_message()
+	if message.is_empty():
+		return false
+	if message["type"] == "close":
+		print("received close message, closing game")
+		get_tree().quit()
+		get_tree().set_pause(false)
+		return true
+
+	if message["type"] == "reset":
+		print("resetting all agents")
+		if message.has("seed"):
+			seed(int(message["seed"]))
+		_reset_agents()
+		just_reset = true
+		get_tree().set_pause(false)
+		return true
+
+	if message["type"] == "step":
+		var actions = message.get("actions")
+		if not actions is Dictionary or actions.size() != 2 or not actions.has("player_0") or not actions.has("player_1"):
+			_protocol_error("Protocol 2 step requires actions for player_0 and player_1")
+			return false
+		for agent in agents_training:
+			agent.set_action(actions[agent.agent_id])
+		need_to_send_obs = true
+		get_tree().set_pause(false)
+		return true
+
+	_protocol_error("Protocol 2 message was not handled")
+	return false
+
+
+func _validate_protocol_two_step(step_agents: Dictionary) -> bool:
+	var first: Dictionary = step_agents["player_0"]
+	var second: Dictionary = step_agents["player_1"]
+	if first.terminated != second.terminated or first.truncated != second.truncated or (first.terminated and first.truncated):
+		_protocol_error("Protocol 2 requires matching episode flags without overlap")
+		return false
+	if first.terminated or first.truncated:
+		if not first.info.has("terminal_observation") or not second.info.has("terminal_observation"):
+			_protocol_error("Protocol 2 requires both terminal observations")
+			return false
+		var outcomes = [first.info.get("outcome"), second.info.get("outcome")]
+		outcomes.sort()
+		if outcomes != ["draw", "draw"] and outcomes != ["loss", "win"]:
+			_protocol_error("Protocol 2 requires complementary outcomes")
+			return false
+	return true
 
 
 func _inference_process():
@@ -447,10 +572,10 @@ func _handshake():
 			_protocol_error("Legacy protocol major mismatch")
 		return
 	var version = message["protocol"]
-	if not version is Dictionary or version.get("major") != PROJECT_PROTOCOL_MAJOR or version.get("minor") != PROJECT_PROTOCOL_MINOR:
+	if not version is Dictionary or not (version.get("major") == PROJECT_PROTOCOL_MAJOR or version.get("major") == PROTOCOL_TWO_MAJOR) or version.get("minor") != PROJECT_PROTOCOL_MINOR:
 		_protocol_error("Project protocol version mismatch")
 		return
-	protocol_major = PROJECT_PROTOCOL_MAJOR
+	protocol_major = int(version["major"])
 	_send_dict_as_json_message({"type": "handshake", "protocol": {"major": protocol_major, "minor": PROJECT_PROTOCOL_MINOR}})
 
 
@@ -533,6 +658,27 @@ func _is_finite_value(value) -> bool:
 
 
 func _send_env_info():
+	if protocol_major == PROTOCOL_TWO_MAJOR:
+		var message = _get_dict_json_message()
+		if message.get("type") != "env_info":
+			_protocol_error("Expected env_info")
+			return
+		var agents := []
+		for agent_idx in agents_training.size():
+			var agent = agents_training[agent_idx]
+			agents.append({
+				"id": agent.agent_id,
+				"observation_space": _obs_space_training[agent_idx],
+				"action_space": _action_space_training[agent_idx]
+			})
+		_send_dict_as_json_message({
+			"type": "env_info",
+			"protocol": {"major": PROTOCOL_TWO_MAJOR, "minor": PROJECT_PROTOCOL_MINOR},
+			"agent_count": agents_training.size(),
+			"agents": agents
+		})
+		return
+
 	if protocol_major == PROJECT_PROTOCOL_MAJOR:
 		_send_project_env_info()
 		return

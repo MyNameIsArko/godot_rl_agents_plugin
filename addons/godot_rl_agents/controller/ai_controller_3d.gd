@@ -9,6 +9,7 @@ enum ControlModes {
 	RECORD_EXPERT_DEMOS ## Record observations and actions for expert demonstrations
 }
 @export var control_mode: ControlModes = ControlModes.INHERIT_FROM_SYNC
+@export var agent_id := ""
 ## The path to a trained .onnx model file to use for inference (overrides the path set in sync node).
 @export var onnx_model_path := ""
 ## Once the number of steps has passed, the flag 'needs_reset' will be set to 'true' for this instance.

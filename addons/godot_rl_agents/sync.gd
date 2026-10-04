@@ -25,6 +25,9 @@ var onnx_models: Dictionary
 
 const MAJOR_VERSION := "0"
 const MINOR_VERSION := "7"
+var protocol_major := 0
+const PROJECT_PROTOCOL_MAJOR := 1
+const PROJECT_PROTOCOL_MINOR := 0
 const DEFAULT_PORT := "11008"
 const DEFAULT_SEED := "1"
 var receive_buffer := PackedByteArray()
@@ -107,6 +110,8 @@ func _initialize_training_agents():
 		if connected:
 			_set_heuristic("model", agents_training)
 			_handshake()
+			if not connected:
+				return
 			_send_env_info()
 		else:
 			push_warning(
@@ -201,6 +206,10 @@ func _physics_process(_delta):
 
 
 func _training_process():
+	if protocol_major == PROJECT_PROTOCOL_MAJOR:
+		_training_process_project()
+		return
+
 	if connected:
 		get_tree().set_pause(true)
 
@@ -225,6 +234,41 @@ func _training_process():
 			#_reset_agents_if_done() # this ensures the new observation is from the next env instance : NEEDS REFACTOR
 
 			var reply = {"type": "step", "obs": obs, "reward": reward, "done": done, "terminated": terminated, "truncated": truncated, "info": info}
+			_send_dict_as_json_message(reply)
+
+		var handled = handle_message()
+
+
+func _training_process_project():
+	if connected:
+		get_tree().set_pause(true)
+
+		var obs = _get_obs_from_agents(agents_training)
+		var info = _get_info_from_agents(agents_training)
+
+		if just_reset:
+			just_reset = false
+
+			var reply = {"type": "reset", "observation": obs[0], "info": info[0]}
+			_send_dict_as_json_message(reply)
+			# this should go straight to getting the action and setting it checked the agent, no need to perform one phyics tick
+			get_tree().set_pause(false)
+			return
+
+		if need_to_send_obs:
+			need_to_send_obs = false
+			var reward = _get_reward_from_agents()
+			var terminated = _get_terminated_from_agents()
+			var truncated = _get_truncated_from_agents()
+
+			var reply = {
+				"type": "step",
+				"observation": obs[0],
+				"reward": reward[0],
+				"terminated": terminated[0],
+				"truncated": truncated[0],
+				"info": info[0]
+			}
 			_send_dict_as_json_message(reply)
 
 		var handled = handle_message()
@@ -394,18 +438,20 @@ func _set_heuristic(heuristic, agents: Array):
 
 
 func _handshake():
-	print("performing handshake")
-
-	var json_dict = _get_dict_json_message()
-	assert(json_dict.get("type", "") == "handshake")
-	var major_version = json_dict["major_version"]
-	var minor_version = json_dict["minor_version"]
-	if major_version != MAJOR_VERSION:
-		print("WARNING: major verison mismatch ", major_version, " ", MAJOR_VERSION)
-	if minor_version != MINOR_VERSION:
-		print("WARNING: minor verison mismatch ", minor_version, " ", MINOR_VERSION)
-
-	print("handshake complete")
+	var message = _get_dict_json_message()
+	if message.get("type") != "handshake":
+		_protocol_error("Expected a handshake message")
+		return
+	if not message.has("protocol"):
+		if message.get("major_version") != MAJOR_VERSION:
+			_protocol_error("Legacy protocol major mismatch")
+		return
+	var version = message["protocol"]
+	if not version is Dictionary or version.get("major") != PROJECT_PROTOCOL_MAJOR or version.get("minor") != PROJECT_PROTOCOL_MINOR:
+		_protocol_error("Project protocol version mismatch")
+		return
+	protocol_major = PROJECT_PROTOCOL_MAJOR
+	_send_dict_as_json_message({"type": "handshake", "protocol": {"major": protocol_major, "minor": PROJECT_PROTOCOL_MINOR}})
 
 
 func _get_dict_json_message() -> Dictionary:
@@ -487,6 +533,9 @@ func _is_finite_value(value) -> bool:
 
 
 func _send_env_info():
+	if protocol_major == PROJECT_PROTOCOL_MAJOR:
+		_send_project_env_info()
+		return
 	var json_dict = _get_dict_json_message()
 	assert(json_dict["type"] == "env_info")
 
@@ -496,6 +545,22 @@ func _send_env_info():
 		"action_space": _action_space_training,
 		"n_agents": len(agents_training),
 		"agent_policy_names": agents_training_policy_names
+	}
+	_send_dict_as_json_message(message)
+
+
+func _send_project_env_info():
+	var json_dict = _get_dict_json_message()
+	assert(json_dict["type"] == "env_info")
+	if agents_training.size() != 1:
+		_protocol_error("Project protocol 1 requires exactly one training agent")
+		return
+	var message = {
+		"type": "env_info",
+		"protocol": {"major": PROJECT_PROTOCOL_MAJOR, "minor": PROJECT_PROTOCOL_MINOR},
+		"observation_space": _obs_space_training[0],
+		"action_space": _action_space_training[0],
+		"agent_count": agents_training.size()
 	}
 	_send_dict_as_json_message(message)
 
@@ -559,6 +624,8 @@ func disconnect_from_server():
 func handle_message() -> bool:
 	# get json message: reset, step, close
 	var message = _get_dict_json_message()
+	if message.is_empty():
+		return false
 	if message.get("type", "") == "close":
 		print("received close message, closing game")
 		get_tree().quit()
@@ -567,6 +634,8 @@ func handle_message() -> bool:
 
 	if message["type"] == "reset":
 		print("resetting all agents")
+		if message.has("seed"):
+			seed(int(message["seed"]))
 		_reset_agents()
 		just_reset = true
 		get_tree().set_pause(false)
@@ -588,6 +657,12 @@ func handle_message() -> bool:
 		print("calling method from Python")
 		_send_dict_as_json_message(reply)
 		return handle_message()
+
+	if protocol_major == PROJECT_PROTOCOL_MAJOR and message.get("type") == "step":
+		agents_training[0].set_action(message["action"])
+		need_to_send_obs = true
+		get_tree().set_pause(false)
+		return true
 
 	if message["type"] == "action":
 		var action = message["action"]
@@ -617,7 +692,8 @@ func _reset_agents_if_done(agents = all_agents):
 func _reset_agents(agents = all_agents):
 	for agent in agents:
 		agent.needs_reset = true
-		#agent.reset()
+		if protocol_major != 0:
+			agent.reset()
 
 
 func _get_obs_from_agents(agents: Array = all_agents):

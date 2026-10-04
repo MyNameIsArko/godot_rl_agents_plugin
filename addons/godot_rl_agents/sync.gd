@@ -216,10 +216,12 @@ func _training_process():
 		if need_to_send_obs:
 			need_to_send_obs = false
 			var reward = _get_reward_from_agents()
+			var terminated = _get_terminated_from_agents()
+			var truncated = _get_truncated_from_agents()
 			var done = _get_done_from_agents()
 			#_reset_agents_if_done() # this ensures the new observation is from the next env instance : NEEDS REFACTOR
 
-			var reply = {"type": "step", "obs": obs, "reward": reward, "done": done, "info": info}
+			var reply = {"type": "step", "obs": obs, "reward": reward, "done": done, "terminated": terminated, "truncated": truncated, "info": info}
 			_send_dict_as_json_message(reply)
 
 		var handled = handle_message()
@@ -577,8 +579,25 @@ func _get_reward_from_agents(agents: Array = agents_training):
 func _get_info_from_agents(agents: Array = all_agents):
 	var info = []
 	for agent in agents:
-		info.append(agent.get_info())
+		var agent_info: Dictionary = agent.get_info().duplicate()
+		if agent.get_terminated() or agent.get_truncated():
+			agent_info["terminal_observation"] = agent.get_obs_done()
+		info.append(agent_info)
 	return info
+
+
+func _get_terminated_from_agents(agents: Array = agents_training):
+	var terminated = []
+	for agent in agents:
+		terminated.append(agent.get_terminated())
+	return terminated
+
+
+func _get_truncated_from_agents(agents: Array = agents_training):
+	var truncated = []
+	for agent in agents:
+		truncated.append(agent.get_truncated())
+	return truncated
 
 
 func _get_done_from_agents(agents: Array = agents_training):
